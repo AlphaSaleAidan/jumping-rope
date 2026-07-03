@@ -25,6 +25,28 @@ ROPE_FILENAME = "ROPE.md"
 DB_FILENAME = "turbovec.db"
 META_FILENAME = "session.json"
 
+# Headroom the compactor needs above the fixed floor (legend + header +
+# anchors) so never-demoted STATE/GOALS lines and KEYS stubs have room.
+MIN_BUDGET_HEADROOM = 64
+
+
+def minimum_budget_tokens(profile_name: str) -> int:
+    """Smallest satisfiable rope budget for a notation profile."""
+    legend = get_profile(profile_name).legend()
+    floor = count_tokens(RopeFile.new("floor", "t", legend).render())
+    return floor + MIN_BUDGET_HEADROOM
+
+
+def _validate_budget(config: JumpConfig) -> None:
+    min_budget = minimum_budget_tokens(config.notation_profile)
+    if config.rope_budget_tokens < min_budget:
+        raise ValueError(
+            f"rope_budget_tokens={config.rope_budget_tokens} is below the "
+            f"satisfiable minimum {min_budget} for profile "
+            f"{config.notation_profile!r} (fixed floor = legend + header + "
+            f"anchors, plus {MIN_BUDGET_HEADROOM} tokens headroom)"
+        )
+
 
 def utc_now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -63,6 +85,7 @@ class JumpingRopeSession:
         force_fallback: bool = False,
         clock: Callable[[], str] = utc_now_iso,
     ) -> None:
+        _validate_budget(config if config is not None else JumpConfig())
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._clock = clock
@@ -87,6 +110,7 @@ class JumpingRopeSession:
             self.rope = RopeFile.new(
                 session_id=sid, timestamp=self._clock(), legend=self.profile.legend()
             )
+        _validate_budget(self.meta.config)  # covers configs loaded from disk
         self.store = TurboVec(
             self.data_dir / DB_FILENAME,
             embedder=embedder,
