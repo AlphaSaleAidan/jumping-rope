@@ -131,7 +131,9 @@ class TurboVec:
     ) -> None:
         self.db_path = Path(db_path)
         self.embedder: Embedder = embedder if embedder is not None else HashEmbedder()
-        self._conn = sqlite3.connect(str(self.db_path))
+        # check_same_thread=False: sessions are single-writer but may be
+        # driven from a different thread (ASGI test clients, thread pools).
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._vec_extension = False if force_fallback else self._try_load_extension()
         self._conn.execute(
             """

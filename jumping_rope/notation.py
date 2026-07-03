@@ -69,6 +69,7 @@ _PHRASE_RULES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
         (r"\b(?:is|are) (?:still )?pending\b", GLYPH_PENDING),
         (r"\bpending\b", GLYPH_PENDING),
         (r"\bwaiting (?:on|for)\b", GLYPH_PENDING),
+        (r"\bdecided to use\b", "chose"),
         (r"\bwithout\b", "w/o"),
         (r"\bwith\b", "w/"),
     )
@@ -77,8 +78,9 @@ _PHRASE_RULES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
 # Filler words removed entirely.
 _FILLER = re.compile(
     r"\b(?:the|a|an|really|very|just|simply|basically|actually|that|which|"
-    r"of course|please|note that|currently|now|then|also|there (?:is|are)|"
-    r"it (?:is|was)|this (?:is|was)|in fact|as expected|going forward)\b",
+    r"of course|please|note that|currently|now|then|also|still|there (?:is|are)|"
+    r"it (?:is|was)|this (?:is|was)|in fact|as expected|going forward|"
+    r"we|us|our)\b",
     re.IGNORECASE,
 )
 
@@ -142,14 +144,13 @@ class SymbolicEnProfile:
 
     def legend(self) -> str:
         return (
-            f"glyphs: {GLYPH_DONE}=done {GLYPH_ACTIVE}=active {GLYPH_FAILED}=failed "
-            f"{GLYPH_PENDING}=pending {ARROW}=yields/then ∵=because +=and "
-            "w/=with w/o=without |=field-sep\n"
+            f"glyphs: {GLYPH_DONE}done {GLYPH_ACTIVE}active {GLYPH_FAILED}failed "
+            f"{GLYPH_PENDING}pending {ARROW}yields ∵because +and w/=with w/o=without\n"
             "abbr: cfg=config impl=implementation fn=function db=database env=environment "
-            "deps=dependencies repo=repository dir=directory app=application auth=authentication "
-            "docs=documentation reqs=requirements perf=performance migr=migration\n"
-            "records: D{n}|date|decision|reason · K{n}|topic|turbovec-id · "
-            "P0..P3=priority (P0 highest)"
+            "deps=dependencies repo=repository dir=directory app=application "
+            "auth=authentication docs=documentation reqs=requirements perf=performance "
+            "migr=migration\n"
+            "rec: D#|date|decision|reason K#|topic|vec-id P0..P3=priority"
         )
 
     def densify(self, text: str) -> str:
@@ -166,11 +167,7 @@ _CJK_MAP: tuple[tuple[re.Pattern[str], str], ...] = tuple(
         (r"tests?", "测"),  # 测
         (r"errors?", "错"),  # 错
         (r"fix(?:es|ed)?", "修"),  # 修
-        (r"users?", "用"),  # 用
-        (r"new", "新"),  # 新
         (r"add(?:s|ed)?", "加"),  # 加
-        (r"delet(?:e|es|ed)", "删"),  # 删
-        (r"remov(?:e|es|ed)", "删"),  # 删
         (r"servers?", "服"),  # 服
         (r"deploy(?:s|ed|ment)?", "部"),  # 部
     )
@@ -188,10 +185,7 @@ class CjkDenseProfile:
         return "cjk-dense"
 
     def legend(self) -> str:
-        cjk = (
-            "cjk: 档=file 测=test 错=error 修=fix 用=user 新=new "
-            "加=add 删=delete/remove 服=server 部=deploy"
-        )
+        cjk = "cjk: 档file 测test 错error 修fix 加add 服server 部deploy"
         return self._base.legend() + "\n" + cjk
 
     def densify(self, text: str) -> str:
