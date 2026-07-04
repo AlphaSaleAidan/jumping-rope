@@ -44,9 +44,35 @@ class RopeValidationError(ValueError):
     """Raised when a rope's structure violates the spec."""
 
 
+# Every code point Python's str.splitlines() treats as a line boundary.
+# Neutralizing only "\n" leaves the rope injectable via \r, \x0b, \x85,
+# U+2028 etc. (adversarial finding A7).
+_LINE_BREAKS = re.compile(r"[\r\n\v\f\x1c\x1d\x1e\x85  ]+")
+_LEADING_HASHES = re.compile(r"^#+")
+_SESSION_ID_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
 def sanitize_field(text: str) -> str:
     """Make free text safe for one-line pipe-delimited records."""
-    return text.replace("\n", "; ").replace("|", "/").strip()
+    return _LINE_BREAKS.sub("; ", text).replace("|", "/").strip()
+
+
+def sanitize_line_leading(text: str, fallback: str) -> str:
+    """Sanitize a field rendered at the START of a line (DELTA path,
+    STATE key). A leading '#' run would otherwise be parsed as a rope
+    anchor or header (adversarial finding A6); it is replaced with the
+    visually equivalent fullwidth '＃'. Empty fields get ``fallback``."""
+    out = sanitize_field(text)
+    match = _LEADING_HASHES.match(out)
+    if match:
+        out = "＃" * len(match.group()) + out[match.end():]
+    return out or fallback
+
+
+def sanitize_session_id(session_id: str) -> str:
+    """Header-safe session id (the header is `| `-delimited free text)."""
+    out = _SESSION_ID_SAFE.sub("-", session_id).strip("-")
+    return out or "session"
 
 
 @dataclass
@@ -118,13 +144,17 @@ class RopeFile:
     @classmethod
     def new(cls, session_id: str, timestamp: str, legend: str) -> RopeFile:
         return cls(
-            session_id=session_id, jump_count=0, timestamp=timestamp, legend=legend
+            session_id=sanitize_session_id(session_id),
+            jump_count=0,
+            timestamp=timestamp,
+            legend=legend,
         )
 
     # -- append API --------------------------------------------------------
 
     def set_state(self, key: str, value: str) -> None:
-        self.state[sanitize_field(key).replace(":", "=")] = sanitize_field(value)
+        safe_key = sanitize_line_leading(key.replace(":", "="), fallback="note")
+        self.state[safe_key] = sanitize_field(value)
 
     def add_goal(self, text: str, status: str = "pending") -> GoalItem:
         glyph = STATUS_GLYPHS.get(status, status)
@@ -157,10 +187,10 @@ class RopeFile:
         return item
 
     def add_delta(self, path: str, change_class: str, summary: str) -> DeltaItem:
-        path_s = sanitize_field(path)
+        path_s = sanitize_line_leading(path, fallback="unknown")
         item = DeltaItem(
             path=path_s,
-            change_class=sanitize_field(change_class),
+            change_class=sanitize_field(change_class) or "mod",
             summary=sanitize_field(summary),
         )
         for i, existing in enumerate(self.delta):

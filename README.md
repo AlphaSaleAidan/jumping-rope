@@ -51,6 +51,43 @@ never demoted; `DECISIONS`/`DELTA` demote oldest-first and `OPEN` demotes
 only P2/P3 items, each leaving a one-line stub in `## KEYS` with a TurboVec
 retrieval key.
 
+## Two modes: bound and unbound
+
+| | **bound** (`rope_budget_tokens=2000`) | **unbound** (`rope_budget_tokens=0`) |
+|---|---|---|
+| The rope | hard token cap; old detail demotes to TurboVec | grows as needed (still dense) — nothing demotes |
+| What gets evicted | rope content (into the vault) | the **transcript**, continuously, as soon as each message is captured |
+| Context clear | episodic jumps every ~8 turns / ~12k tokens | continuous — outbound is always `[rope] + current message` |
+| Detail access | retrieval (cache miss) | everything verbatim on the rope |
+| Failure surface | retrieval recall (see limitations) | rope size on very long sessions |
+
+**Use bound when:** the model's context window is small or expensive; the
+agent runs unattended for days and cost dominates; sessions are noisy (lots
+of churn that will never be asked about again); you're metering an API
+middleware where every token is billed.
+
+**Use unbound when:** the work is interactive and a retrieval miss would
+stall you (decisions and facts stay verbatim on the rope — no recall risk);
+the model has a large, cheap context window; sessions are hours-to-days, not
+weeks; you want the key log to double as a browsable index of the whole
+conversation (every archived message gets a `t{turn}`-stamped K-line, so
+`## KEYS` lines up with the context log).
+
+Switch per session: `jrope init --mode unbound`, `JumpConfig.unbound()`, the
+pipe's `MODE` valve, or the proxy's `JROPE_MODE` env. The pipe and proxy
+default to **unbound** (streaming eviction); the Python API defaults to
+**bound** for backward compatibility.
+
+When `## KEYS` itself grows past what the budget allows, the oldest stubs
+coalesce into a **keyring**: one TurboVec record bundling the stubs, replaced
+in the rope by a single digest stub `K{n}|KR:tok1,tok2,… [+n]|{key}` carrying
+one significant token per transitive member (newest members win a 48-token
+digest budget; `+n` marks overflow). A cold reader — human or model — matches
+its question against the digest, retrieves the keyring, and recurses into the
+member stubs it lists. Adversarially verified: a literal-minded cold agent
+recovers 20/20 planted facts through a hostile-compaction rope with keyring
+generations 4 deep (see `ADVERSARIAL_REPORT.md`, finding A1).
+
 ## Quickstart 1 — Python library
 
 ```bash
@@ -129,6 +166,14 @@ the bundled reference tokenizer:
 | plain prose   | 140            | —                  | —           |
 | `symbolic-en` | 81             | **42.1%**          | 97 tokens   |
 | `cjk-dense`   | 83             | 40.7%              | 119 tokens  |
+| `ai-native`   | = symbolic-en on one-off text; **−17.5% more on repetitive sessions** (966 → 797 rope tokens, 30 recurring events) | | 97 + dictionary |
+
+`ai-native` is symbolic-en plus an **adaptive per-session dictionary**: it
+mines the session's own recurring phrases and assigns them short codes
+(`§a`, `§b`, …) declared once in the legend — LZ-style compression whose
+dictionary the reader model can see. Content is expanded back to natural
+language before it reaches TurboVec, so retrieval is unaffected. The
+dictionary persists across restarts with the session.
 
 **Honest caveat:** under o200k_base, `cjk-dense` is *not* better than
 `symbolic-en` — single CJK characters frequently cost as much as or more
@@ -144,15 +189,42 @@ history grows while the rope stays flat.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `rope_budget_tokens` | 2000 | hard cap; compactor demotes to fit after every write |
-| `jump_threshold_tokens` | 12000 | jump when est. live context exceeds this |
-| `jump_every_n_turns` | 8 | jump at least this often |
-| `notation_profile` | `symbolic-en` | or `cjk-dense` |
+| `rope_budget_tokens` | 2000 | hard cap (bound mode); **0/None = unbound mode** |
+| `jump_threshold_tokens` | 12000 | bound mode: jump when est. live context exceeds this |
+| `jump_every_n_turns` | 8 | bound mode: jump at least this often |
+| `notation_profile` | `symbolic-en` | or `cjk-dense`, `ai-native` |
+
+**Minimum budget.** A budget below the satisfiable minimum is rejected at
+construction with a `ValueError` naming the computed minimum:
+`minimum_budget_tokens(profile) = fixed floor (legend + header + anchors) +
+64 tokens headroom` — **219 tokens** for `symbolic-en` under o200k_base
+(measured floor: 155, regression-pinned in the adversarial suite).
 
 Embedders: `HashEmbedder` (default; deterministic, dependency-free) or
 `SentenceTransformerEmbedder` (`pip install "jumping-rope[st]"`). The
 sqlite-vec extension (`[vec]` extra) accelerates search when present; a
 pure-SQLite brute-force fallback keeps everything working without it.
+
+## Limitations (measured, adversarial suite)
+
+- **Hash embeddings miss paraphrases under near-duplicate load.** With 200
+  distractors differing from a true record by one token (port numbers,
+  negation), top-3 semantic search finds the record for verbatim and
+  near-verbatim queries but **not** for a paraphrase ("which port does the
+  sentinel service keep open…") — 67% hit rate across the three query styles
+  (finding A12). One-token differences are near-invisible to bag-of-ngram
+  hashing. Exact-key retrieval is immune (keys are content-addressed). If
+  you need paraphrase-robust recall, install the `[st]` extra and use
+  `SentenceTransformerEmbedder`.
+- **Keyring depth vs. literal readers.** Facts buried deeper than ~3 keyring
+  generations are beyond a literal reader's stub-following recursion; they
+  remain retrievable via semantic search and exact keys (finding A1,
+  recovery-path table in `ADVERSARIAL_REPORT.md`).
+- **Crash semantics are at-least-once.** A crash between a TurboVec write
+  and the rope save can leave a fact both in the rope and in the store;
+  content-addressed keys guarantee the duplicate collapses on the next
+  demotion (findings A9/A10). Nothing is ever lost, but readers may briefly
+  see a fact twice.
 
 ## Development
 

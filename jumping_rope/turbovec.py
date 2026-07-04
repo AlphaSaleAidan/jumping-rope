@@ -13,6 +13,7 @@ import hashlib
 import math
 import sqlite3
 import struct
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -100,6 +101,7 @@ class VecRecord:
     content: str
     tokens: int
     created_at: str
+    turn: int = -1  # provenance: session turn that produced this record
 
 
 def _serialize(vec: list[float]) -> bytes:
@@ -131,8 +133,10 @@ class TurboVec:
     ) -> None:
         self.db_path = Path(db_path)
         self.embedder: Embedder = embedder if embedder is not None else HashEmbedder()
-        # check_same_thread=False: sessions are single-writer but may be
-        # driven from a different thread (ASGI test clients, thread pools).
+        # check_same_thread=False + an RLock: one connection may be driven
+        # from several threads (ASGI test clients, thread pools); sqlite's
+        # serialized mode does not protect interleaved cursor use.
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._vec_extension = False if force_fallback else self._try_load_extension()
         self._conn.execute(
@@ -146,10 +150,17 @@ class TurboVec:
                 content TEXT NOT NULL,
                 tokens INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
-                embedding BLOB NOT NULL
+                embedding BLOB NOT NULL,
+                turn INTEGER NOT NULL DEFAULT -1
             )
             """
         )
+        try:  # migrate pre-provenance databases in place
+            self._conn.execute(
+                "ALTER TABLE records ADD COLUMN turn INTEGER NOT NULL DEFAULT -1"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
         self._conn.commit()
 
     def _try_load_extension(self) -> bool:
@@ -169,6 +180,14 @@ class TurboVec:
 
     # -- API ----------------------------------------------------------------
 
+    @staticmethod
+    def content_key(session_id: str, section: str, content: str) -> str:
+        """The deterministic key put() assigns to this exact content."""
+        digest = hashlib.sha1(
+            f"{session_id}\x1f{section}\x1f{content}".encode()
+        ).hexdigest()
+        return f"tv-{digest[:16]}"
+
     def put(
         self,
         *,
@@ -178,34 +197,43 @@ class TurboVec:
         content: str,
         key: str | None = None,
         created_at: str = "",
+        turn: int = -1,
     ) -> str:
-        """Store content; returns the retrieval key."""
+        """Store content; returns the retrieval key.
+
+        Keys are content-addressed: the same (session_id, section, content)
+        always maps to the same key and is stored at most once, so crash-retry
+        re-demotion can never duplicate records (adversarial findings A9/A10).
+        """
         rec_id = uuid.uuid4().hex
-        rec_key = key if key is not None else f"tv-{rec_id[:12]}"
+        rec_key = key if key is not None else self.content_key(session_id, section, content)
         embedding = self.embedder.embed(content)
-        self._conn.execute(
-            "INSERT INTO records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                rec_id,
-                session_id,
-                jump_index,
-                section,
-                rec_key,
-                content,
-                count_tokens(content),
-                created_at,
-                _serialize(embedding),
-            ),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    rec_id,
+                    session_id,
+                    jump_index,
+                    section,
+                    rec_key,
+                    content,
+                    count_tokens(content),
+                    created_at,
+                    _serialize(embedding),
+                    turn,
+                ),
+            )
+            self._conn.commit()
         return rec_key
 
     def get(self, key: str) -> VecRecord | None:
-        row = self._conn.execute(
-            "SELECT id, session_id, jump_index, section, key, content, tokens, "
-            "created_at FROM records WHERE key = ?",
-            (key,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, session_id, jump_index, section, key, content, tokens, "
+                "created_at, turn FROM records WHERE key = ?",
+                (key,),
+            ).fetchone()
         if row is None:
             return None
         return VecRecord(*row)
@@ -226,29 +254,31 @@ class TurboVec:
         if session_id is not None:
             params.append(session_id)
         params.append(k)
-        rows = self._conn.execute(
-            f"""
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
             SELECT id, session_id, jump_index, section, key, content, tokens,
-                   created_at, vec_distance_cosine(embedding, ?) AS d
+                   created_at, turn, vec_distance_cosine(embedding, ?) AS d
             FROM records {where}
             ORDER BY d ASC, key ASC LIMIT ?
             """,
             params,
         ).fetchall()
-        return [VecRecord(*row[:8]) for row in rows]
+        return [VecRecord(*row[:9]) for row in rows]
 
     def _search_fallback(
         self, qvec: list[float], k: int, session_id: str | None
     ) -> list[VecRecord]:
         where = "WHERE session_id = ?" if session_id is not None else ""
         params: tuple[str, ...] = (session_id,) if session_id is not None else ()
-        rows = self._conn.execute(
-            "SELECT id, session_id, jump_index, section, key, content, tokens, "
-            f"created_at, embedding FROM records {where}",
-            params,
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, session_id, jump_index, section, key, content, tokens, "
+                f"created_at, turn, embedding FROM records {where}",
+                params,
+            ).fetchall()
         scored = [
-            (-_cosine(qvec, _deserialize(row[8])), row[4], VecRecord(*row[:8]))
+            (-_cosine(qvec, _deserialize(row[9])), row[4], VecRecord(*row[:9]))
             for row in rows
         ]
         scored.sort(key=lambda t: (t[0], t[1]))
@@ -258,20 +288,22 @@ class TurboVec:
         """All records (optionally one session), insertion order."""
         where = "WHERE session_id = ?" if session_id is not None else ""
         params: tuple[str, ...] = (session_id,) if session_id is not None else ()
-        rows = self._conn.execute(
-            "SELECT id, session_id, jump_index, section, key, content, tokens, "
-            f"created_at FROM records {where} ORDER BY rowid",
-            params,
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, session_id, jump_index, section, key, content, tokens, "
+                f"created_at, turn FROM records {where} ORDER BY rowid",
+                params,
+            ).fetchall()
         return [VecRecord(*row) for row in rows]
 
     def stats(self) -> dict[str, object]:
-        total, tokens = self._conn.execute(
-            "SELECT COUNT(*), COALESCE(SUM(tokens), 0) FROM records"
-        ).fetchone()
-        sessions = self._conn.execute(
-            "SELECT COUNT(DISTINCT session_id) FROM records"
-        ).fetchone()[0]
+        with self._lock:
+            total, tokens = self._conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(tokens), 0) FROM records"
+            ).fetchone()
+            sessions = self._conn.execute(
+                "SELECT COUNT(DISTINCT session_id) FROM records"
+            ).fetchone()[0]
         return {
             "records": int(total),
             "tokens": int(tokens),
@@ -282,7 +314,8 @@ class TurboVec:
         }
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
 
 def format_retrieved(key: str, content: str) -> str:

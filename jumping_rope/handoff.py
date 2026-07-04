@@ -8,6 +8,7 @@ the rope (tier 1) or TurboVec (tier 2).
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -59,6 +60,63 @@ def record_turn(session: JumpingRopeSession, messages: Sequence[Mapping[str, Any
             session.archive(topic=gist(text), content=text)
 
 
+def apply_streaming_policy(
+    session: JumpingRopeSession, messages: Sequence[Mapping[str, Any]]
+) -> tuple[list[Message], bool]:
+    """Unbound-rope mode: continuous transcript eviction, no episodic jump.
+
+    Every transcript message whose content is already captured (archived
+    full-fidelity in TurboVec, indexed by a t{turn}-stamped K-line) is
+    auto-removed from the outgoing history. Outbound = [system: rope] +
+    the uncovered tail (always including the current user message). The
+    live context stays flat every turn instead of sawtoothing between
+    jumps.
+
+    Returns (outbound_messages, evicted_any).
+    """
+    session.meta.turns_since_jump += 1
+    session.meta.total_turns += 1
+    kept: list[Message] = []
+    newly_seen: list[tuple[str, str, str]] = []  # (role, coverage text, topic)
+    client_system: list[Message] = []  # A14: the client's instructions survive
+    last_user = last_user_message(messages)
+    last_user_text = message_text(last_user) if last_user is not None else None
+    evicted = False
+    for message in messages:
+        role = str(message.get("role", "?"))
+        if role == "system":
+            client_system.append(dict(message))
+            continue
+        text = message_text(message)
+        if not text.strip():
+            content = message.get("content")
+            if not content:
+                continue
+            # A15: non-text content (images, tool payloads) is covered via a
+            # canonical-JSON surrogate so it evicts like text — never vanishes.
+            text = json.dumps(content, sort_keys=True, ensure_ascii=False)
+            topic = f"{role}: [non-text content]"
+        else:
+            topic = f"{role}: {gist(text)}"
+        is_current = role == "user" and text == last_user_text
+        if session.is_covered(text) and not is_current:
+            evicted = True  # equivalent data already captured — drop it
+            continue
+        kept.append(dict(message))
+        if not session.is_covered(text):
+            newly_seen.append((role, text, topic))
+    for _role, text, topic in newly_seen:  # covered from the NEXT call onward
+        session.archive(topic=topic, content=text)
+    outbound: list[Message] = [
+        *client_system,
+        {"role": "system", "content": session.rope.render()},
+        *kept,
+    ]
+    session.meta.live_context_tokens = history_tokens(outbound)
+    session.save()
+    return outbound, evicted
+
+
 def apply_jump_policy(
     session: JumpingRopeSession, messages: Sequence[Mapping[str, Any]]
 ) -> tuple[list[Message], bool]:
@@ -75,7 +133,12 @@ def apply_jump_policy(
     if not session.should_jump():
         return [dict(m) for m in messages], False
     rope_text = session.jump()
-    outbound: list[Message] = [{"role": "system", "content": rope_text}]
+    # A14: the client's own system messages carry standing instructions —
+    # the jump replaces the HISTORY, not the contract.
+    outbound: list[Message] = [
+        dict(m) for m in messages if m.get("role") == "system"
+    ]
+    outbound.append({"role": "system", "content": rope_text})
     last_user = last_user_message(messages)
     if last_user is not None:
         outbound.append(last_user)
